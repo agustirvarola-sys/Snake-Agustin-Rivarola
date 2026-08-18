@@ -539,7 +539,7 @@ async def play(websocket):
 
 
 async def start(auth_token):
-    uri = "wss://codechallenge-server.up.railway.app/ws?token={}".format(auth_token)
+   uri = "wss://server.codechallenge.net.ar/ws?token={}".format(auth_token)
     while True:
         try:
             print('connection to {}'.format(uri))
