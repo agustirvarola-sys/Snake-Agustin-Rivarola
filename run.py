@@ -1,5 +1,6 @@
 
 
+
 import asyncio
 import json
 import os
@@ -13,13 +14,17 @@ except ImportError:  # permite importar el cerebro sin la libreria (tests)
     websockets = None
 
 
+BOT_VERSION = "v2.0-reglas-v4"   # <-- si al arrancar no ves esto, estas corriendo el bot VIEJO
+
 
 
 MOVE_BUDGET = 0.060       # presupuesto blando por jugada (s) - el bot viejo usaba 0.10
 HARD_BUDGET = 0.085       # corte duro: por encima de esto devuelvo lo mejor que tenga
 
 AVG_DIGIT_BASE = 500.0    # valor base promedio de un digito (digitos 1..9 -> media 5 -> 500)
-DIGIT_RATE = 0.070        # digitos que espero comer por movimiento propio (calibrado)
+DIGIT_RATE = 0.070        # digitos por movimiento propio, si la adaptacion esta apagada
+DIGIT_RATE_ADAPTIVE = False  # probado: no mejora. Interruptor disponible por si querés reprobarlo
+DIGIT_RATE_K = 2.24       # tasa = K / (filas + columnas); calibrado en 16x16 -> 0.070
 
 DENIAL_W = 0.20           # peso de negarle el digito al rival (secuencia compartida)
 LOST_RACE_DIGIT = 0.20    # si el rival llega antes al digito, cuanto queda de su valor
@@ -64,6 +69,7 @@ def log_action(game_id, message):
 def write_game_log(game_id):
     try:
         with open("game_{}.log".format(game_id), "w") as f:
+            f.write("# bot_version: {}\n".format(BOT_VERSION))
             f.write("\n".join(HISTORY.get(game_id, [])) + "\n")
         print("saved game_{}.log".format(game_id))
     except OSError as e:
@@ -232,6 +238,7 @@ class Brain:
     def __init__(self):
         self.games = {}
         self.timings = []
+        self.eaten_ok = self.eaten_x = self.eaten_bad = 0
 
     def _game(self, game_id):
         g = self.games.get(game_id)
@@ -247,6 +254,7 @@ class Brain:
     def _setup_grid(self, rows, cols):
         self.rows = rows
         self.cols = cols
+        self._rate = (DIGIT_RATE_K / (rows + cols)) if DIGIT_RATE_ADAPTIVE else DIGIT_RATE
         cached = Brain._grid_cache.get((rows, cols))
         if cached is not None:
             self.nbrs, self.exp_dist = cached
@@ -381,16 +389,20 @@ class Brain:
 
     # ---------------- valoracion ----------------
 
-    @staticmethod
-    def future_base(moves_left):
+    def future_base(self, moves_left):
         """Puntos base de digitos que espero cosechar en lo que queda.
 
         Es exactamente lo que agrega subir el multiplicador en +1, porque el
         multiplicador es aditivo: cada digito futuro suma una base mas.
+
+        La tasa se adapta al tablero: en uno de 20x20 cada bocado cuesta casi
+        el doble de movimientos que en uno de 12x12, asi que voy a comer la
+        mitad de digitos y una X vale la mitad. Con la tasa fija sobrevaloraba
+        las X en tableros grandes y las subvaloraba en los chicos.
         """
         if moves_left <= 0:
             return 0.0
-        return AVG_DIGIT_BASE * DIGIT_RATE * moves_left
+        return AVG_DIGIT_BASE * self._rate * moves_left
 
     def _x_value(self, moves_left_on_arrival):
         return 50.0 + self.future_base(moves_left_on_arrival)
@@ -533,6 +545,22 @@ class Brain:
                                        wrong, tgt_cell, nxt_cell, rows, cols,
                                        my_score, opp_score, my_moves)
 
+        # Contabilidad de lo comido: miro que hay en la casilla a la que voy.
+        dr, dc = DIRS[direction]
+        dest = (head[0] + dr, head[1] + dc)
+        if dest in digits:
+            if dest == tgt_cell:
+                self.eaten_ok += 1
+            else:
+                self.eaten_bad += 1
+        elif dest in ent['X']:
+            self.eaten_x += 1
+
+        self.last = {'plans': len(plans), 'best': best, 'dir': direction,
+                     'survival': best is None, 'tgt': tgt_cell, 'tval': tgt_val,
+                     'seq': seq, 'wrong': wrong, 'head': head,
+                     'my_moves': my_moves, 'legal': [n for n, _ in legal],
+                     'base': {k: (v['safe'], v['area']) for k, v in base.items()}}
         self.timings.append(time.perf_counter() - t0)
         return direction
 
@@ -856,11 +884,24 @@ async def play(websocket):
                     log_event(game_id, request_data)
                     write_game_log(game_id)
                     BRAIN.games.pop(game_id, None)
+                d = request_data['data']
+                side = 'A' if d.get('player_1') == d.get('winner') else None
+                print('-' * 62)
+                print('FIN | bot {} | score_1 {} (x{}) | score_2 {} (x{}) | gana {}'
+                      .format(BOT_VERSION, d.get('score_1'), d.get('multiplier_1'),
+                              d.get('score_2'), d.get('multiplier_2'), d.get('winner')))
+                print('comidos: {} digitos correctos, {} X, {} digitos ERRADOS'
+                      .format(BRAIN.eaten_ok, BRAIN.eaten_x, BRAIN.eaten_bad))
+                if BRAIN.eaten_bad:
+                    print('AVISO: comer un digito equivocado son -500. Si este numero '
+                          'no es 0, mandame el log.')
                 if BRAIN.timings:
                     ts = BRAIN.timings
                     print('tiempo por jugada: medio {:.1f} ms | maximo {:.1f} ms'
                           .format(1000 * sum(ts) / len(ts), 1000 * max(ts)))
-                    BRAIN.timings = []
+                print('-' * 62)
+                BRAIN.timings = []
+                BRAIN.eaten_ok = BRAIN.eaten_x = BRAIN.eaten_bad = 0
 
             elif event == 'error':
                 print('server error: {}'.format(request_data.get('data')))
@@ -877,6 +918,11 @@ async def start(auth_token):
     uri = "wss://server.codechallenge.net.ar/ws?token={}".format(auth_token)
     while True:
         try:
+            print('=' * 62)
+            print(' BOT SNAKE {} | reglas v4: digitos + X + tablero variable'
+                  .format(BOT_VERSION))
+            print(' presupuesto por jugada: {:.0f} ms'.format(MOVE_BUDGET * 1000))
+            print('=' * 62)
             print('connecting to {}'.format(uri))
             async with websockets.connect(uri) as websocket:
                 print('connection READY!')
