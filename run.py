@@ -1,5 +1,39 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+============================================================================
+ BOT DE SNAKE - codechallenge - reglas v4 (16 sep 2026)
+ Uso:  python run.py <TU_TOKEN>
+============================================================================
 
+ MODELO DEL JUEGO (verificado contra logs reales de partidas):
 
+   * Tablero variable: rows x cols, cada uno entre 12 y 20. Vienen en turn_data.
+   * Siempre hay EXACTAMENTE 5 digitos y EXACTAMENTE 2 X en el tablero.
+   * Los 5 digitos son consecutivos ciclicos (...7,8,9,1,2...). El objetivo es
+     aquel cuyo predecesor ciclico NO esta en el tablero. Verificado 21/21.
+   * La secuencia es GLOBAL: si el rival come el objetivo, avanza para los dos.
+   * Digito correcto: +digito*100*MI_multiplicador, crece +1.
+   * Digito incorrecto: -500 fijo (NO se multiplica), crece +1, reaparece.
+   * X: +50 fijo, multiplicador +1 permanente, NO crece.
+   * Sobrevivir un movimiento: +1.
+   * Chocar (pared / cuerpo propio / rival): -500 y el rival +1000, fin.
+   * El juego es POR TURNOS (A mueve, despues B). No hay choques simultaneos:
+     solo pierdo si YO me muevo a una casilla ocupada AHORA. El tablero que
+     recibo es exacto, asi que la seguridad inmediata es exacta.
+   * 300 movimientos totales = 150 por jugador.
+
+ IDEA CENTRAL DE LA ESTRATEGIA:
+
+   El multiplicador es aditivo, asi que el valor marginal de una X es
+   constante: sumar +1 al multiplicador agrega exactamente "una vez la base"
+   a CADA digito que coma en lo que resta. Con ~150 movimientos por delante
+   eso vale miles de puntos, no 50. Por eso una X temprana >> cualquier
+   digito. Pero el multiplicador sin digitos no sirve (en los logs un bot
+   llego a x13 y saco 4536 porque solo comio 2 digitos). El bot balancea
+   ambos automaticamente evaluando PUNTOS POR MOVIMIENTO.
+============================================================================
+"""
 
 import asyncio
 import json
@@ -16,7 +50,12 @@ except ImportError:  # permite importar el cerebro sin la libreria (tests)
 
 BOT_VERSION = "v2.0-reglas-v4"   # <-- si al arrancar no ves esto, estas corriendo el bot VIEJO
 
-
+# ============================================================================
+#  CONSTANTES DE AJUSTE
+#  Calibradas con un simulador propio: ~1500 partidas contra bots rivales de
+#  referencia, eligiendo por comparacion PAREADA (misma semilla para cada
+#  configuracion) y revalidando el ganador sobre semillas nunca usadas.
+# ============================================================================
 
 MOVE_BUDGET = 0.060       # presupuesto blando por jugada (s) - el bot viejo usaba 0.10
 HARD_BUDGET = 0.085       # corte duro: por encima de esto devuelvo lo mejor que tenga
@@ -521,8 +560,8 @@ class Brain:
         # ---- validar seguridad y elegir ----
         best = None
         for p in sorted(plans, key=lambda p: p['score'], reverse=True):
-            if time.perf_counter() > hard and best is not None:
-                break
+            if time.perf_counter() > hard:
+                break      # sin tiempo: mejor caer a supervivencia que arriesgar
             # Guarda dura: el plan puede APUNTAR a un digito que todavia no esta
             # activo (esperando que el rival avance la secuencia), pero jamas
             # puede PISARLO antes de tiempo: eso son -500 seguros.
@@ -697,6 +736,7 @@ class Brain:
                         'moves': st['moves'] + k, 'value': st['value'] + v,
                         'first': first,
                         'order1': order if want_parent else st['order1'],
+                        'kind': kind,
                         'si': st['si'] + (2 if kind == 'skip'
                                           else 1 if kind == 'digit' else 0),
                         'xs': st['xs'] - {cell} if kind == 'X' else st['xs'],
@@ -936,7 +976,11 @@ async def start(auth_token):
             time.sleep(3)
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':   # pragma: no cover
+    if len(sys.argv) >= 2:
+        asyncio.run(start(sys.argv[1]))
+    else:
+        print('please provide your auth_token')
     if len(sys.argv) >= 2:
         asyncio.run(start(sys.argv[1]))
     else:
