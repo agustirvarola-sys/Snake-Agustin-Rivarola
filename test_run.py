@@ -1,4 +1,5 @@
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ============================================================================
  TESTS DEL BOT DE SNAKE
@@ -83,7 +84,6 @@ def limpiar_estado():
     """Cada test arranca con un cerebro limpio, sin memoria de partidas."""
     run.BRAIN.games.clear()
     run.BRAIN.timings = []
-    run.BRAIN.eaten_ok = run.BRAIN.eaten_x = run.BRAIN.eaten_bad = 0
     run.HISTORY.clear()
     yield
     run.BRAIN.games.clear()
@@ -734,8 +734,9 @@ class TestContabilidad:
     def test_cuenta_los_digitos_correctos(self):
         b = board('aA1 ', '  2 ', ' 3 4', '5  B')
         run.BRAIN.decide(td(b, 'A'))
-        assert run.BRAIN.eaten_ok == 1
-        assert run.BRAIN.eaten_bad == 0
+        st = run.BRAIN.stats('g_test')
+        assert st['ok'] == 1
+        assert st['bad'] == 0
 
     def test_cuenta_las_X(self):
         b = board(
@@ -756,7 +757,7 @@ class TestContabilidad:
             '               ',
         )
         run.BRAIN.decide(td(b, 'A'))
-        assert run.BRAIN.eaten_x == 1
+        assert run.BRAIN.stats('g_test')['x'] == 1
 
     def test_log_event_y_action(self):
         run.log_event('g1', {'event': 'x'})
@@ -848,16 +849,16 @@ class TestRed:
 
     def test_game_over_guarda_el_log_y_resetea(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        run.BRAIN.eaten_ok = 3
-        run.BRAIN.eaten_bad = 1
-        run.BRAIN.timings = [0.001, 0.002]
+        g = run.BRAIN._game('gz')
+        g['ok'] = 3; g['bad'] = 1; g['times'] = [0.001, 0.002]
         fin = {'game_id': 'gz', 'board': '|A|', 'score_1': 100, 'score_2': 50,
                'multiplier_1': 2, 'multiplier_2': 1, 'winner': 'p1', 'player_1': 'p1'}
         ws = FakeWS([ev('game_over', fin)])
         asyncio.run(run.play(ws))
         assert (tmp_path / 'game_gz.log').exists()
-        assert run.BRAIN.eaten_ok == 0 and run.BRAIN.eaten_bad == 0
-        assert run.BRAIN.timings == []
+        # el estado de la partida se suelta al terminar
+        assert 'gz' not in run.BRAIN.games
+        assert run.BRAIN.stats('gz') == {'ok': 0, 'x': 0, 'bad': 0, 'times': []}
 
     def test_game_over_sin_game_id(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -1056,7 +1057,7 @@ class TestRamasDefensivas:
         b = board('A2 ', 'a  ', '  1')
         d = run.BRAIN.decide(td(b, 'A'))
         assert d == 'right'
-        assert run.BRAIN.eaten_bad == 1
+        assert run.BRAIN.stats('g_test')['bad'] == 1
 
     def test_desesperado_en_un_tablero_de_una_casilla(self):
         assert run.Brain._desperate((0, 0), 1, 1, set()) == 'up'
@@ -1209,3 +1210,78 @@ class TestRamasDefensivas:
         finally:
             monkeypatch.setattr(run.time, 'perf_counter', real)
         assert d in run.DIRS
+
+
+# ============================================================================
+#  14. PARTIDAS SIMULTANEAS Y ESTADO ACOTADO
+#      (los dos defectos que la cobertura del 99% no habia detectado)
+# ============================================================================
+
+class TestPartidasSimultaneas:
+
+    TABLERO_CHICO = board(
+        'aaA         ', '   1        ', '     2      ', '       3    ',
+        '         4  ', '  5         ', '     X      ', '        X   ',
+        '            ', '      Bbb   ', '            ', '            ',
+    )
+    TABLERO_GRANDE = board(
+        'aaA              ', '      1          ', '        2        ',
+        '          3      ', '            4    ', '  5              ',
+        '       X         ', '            X    ', '                 ',
+        '         Bbb     ', '                 ', '                 ',
+        '                 ', '                 ', '                 ',
+        '                 ', '                 ', '                 ',
+    )
+
+    def test_dos_partidas_de_distinto_tamaño_a_la_vez(self):
+        for _ in range(4):
+            d1 = run.choose_direction(td(self.TABLERO_CHICO, 'A', 12, 12, game_id='G1'))
+            d2 = run.choose_direction(td(self.TABLERO_GRANDE, 'A', 18, 17, game_id='G2'))
+            assert d1 in run.DIRS and d2 in run.DIRS
+        assert set(run.BRAIN.games) == {'G1', 'G2'}
+
+    def test_cada_partida_lleva_sus_propios_contadores(self):
+        # En G1 la cabeza tiene la X al lado; en G2 no come nada.
+        con_x = board(
+            'aAX            ', '               ', '   1   2       ',
+            '    3     4    ', '  5            ', '           X   ',
+            '               ', '               ', '               ',
+            '        Bbb    ', '               ', '               ',
+            '               ', '               ', '               ',
+        )
+        run.choose_direction(td(con_x, 'A', 15, 15, game_id='CON_X'))
+        run.choose_direction(td(self.TABLERO_GRANDE, 'A', 18, 17, game_id='SIN_X'))
+        assert run.BRAIN.stats('CON_X')['x'] == 1
+        assert run.BRAIN.stats('SIN_X')['x'] == 0, 'se mezclaron los contadores'
+
+    def test_los_tiempos_tambien_son_por_partida(self):
+        run.choose_direction(td(self.TABLERO_CHICO, 'A', 12, 12, game_id='T1'))
+        for _ in range(3):
+            run.choose_direction(td(self.TABLERO_GRANDE, 'A', 18, 17, game_id='T2'))
+        assert len(run.BRAIN.stats('T1')['times']) == 1
+        assert len(run.BRAIN.stats('T2')['times']) == 3
+
+    def test_no_acumula_estado_de_partidas_huerfanas(self):
+        """Si una partida se corta sin game_over su estado no debe quedar para
+        siempre: con muchas reconexiones la memoria creceria sin limite."""
+        for n in range(60):
+            run.choose_direction(td(self.TABLERO_CHICO, 'A', 12, 12,
+                                    game_id='huerfana_{}'.format(n)))
+        assert len(run.BRAIN.games) <= run.MAX_TRACKED_GAMES
+
+    def test_desaloja_la_mas_vieja_y_conserva_la_activa(self):
+        run.choose_direction(td(self.TABLERO_CHICO, 'A', 12, 12, game_id='ACTIVA'))
+        for n in range(run.MAX_TRACKED_GAMES + 3):
+            run.choose_direction(td(self.TABLERO_CHICO, 'A', 12, 12,
+                                    game_id='otra_{}'.format(n)))
+            # la sigo tocando, asi que no debe ser la desalojada
+            run.choose_direction(td(self.TABLERO_CHICO, 'A', 12, 12, game_id='ACTIVA'))
+        assert 'ACTIVA' in run.BRAIN.games
+
+    def test_la_ventana_global_de_tiempos_esta_acotada(self):
+        run.BRAIN.timings = [0.001] * 2500
+        run.choose_direction(td(self.TABLERO_CHICO, 'A', 12, 12, game_id='W'))
+        assert len(run.BRAIN.timings) <= 2000
+
+    def test_stats_de_una_partida_inexistente(self):
+        assert run.BRAIN.stats('no_existe') == {'ok': 0, 'x': 0, 'bad': 0, 'times': []}
