@@ -40,7 +40,7 @@ import json
 import os
 import sys
 import time
-from collections import deque
+from collections import deque, OrderedDict
 
 try:
     import websockets
@@ -73,12 +73,15 @@ SKIP_ENABLED = True       # dejarle el digito barato al rival y tomar el siguien
 SKIP_W = 0.90             # confianza en esa jugada de espera
 WRONG_DIGIT_COST = 500.0  # penalizacion por pisar un digito equivocado
 
+MAX_TRACKED_GAMES = 8     # partidas cuyo estado mantengo en memoria a la vez
+
 BEAM_WIDTH = 5            # planes que sobreviven en cada nivel de la busqueda
 MAX_LEGS = 5              # objetivos encadenados (veo hasta 5 digitos por delante)
 LEG_CONFIDENCE = 0.92     # confianza que le resto a cada tramo extra de la cadena
 REPOS_W = 1.0             # peso del costo de reposicionamiento (ver exp_dist)
 
 SAFETY_MARGIN = 2         # casillas libres extra que exijo ademas de mi largo
+SAFETY_OPP_STATIC = True  # al medir MI espacio, el cuerpo rival no se libera solo
 MAX_PLAN_LEN = 30         # no planifico rutas mas largas que esto
 
 DIRS = {
@@ -275,16 +278,33 @@ class Brain:
     """Decide el movimiento. Un Brain por proceso; estado por game_id."""
 
     def __init__(self):
-        self.games = {}
+        # OrderedDict para poder desalojar la partida mas vieja: si una se corta
+        # sin game_over (una desconexion, por ejemplo) su estado quedaria para
+        # siempre, y con muchas reconexiones la memoria crece sin limite.
+        self.games = OrderedDict()
         self.timings = []
-        self.eaten_ok = self.eaten_x = self.eaten_bad = 0
 
     def _game(self, game_id):
         g = self.games.get(game_id)
         if g is None:
-            g = {'me': BodyTracker(), 'opp': BodyTracker()}
+            # Los contadores viven ACA, por partida. Si fueran del cerebro se
+            # mezclarian entre partidas simultaneas y el resumen final mentiria.
+            g = {'me': BodyTracker(), 'opp': BodyTracker(),
+                 'ok': 0, 'x': 0, 'bad': 0, 'times': []}
             self.games[game_id] = g
+            while len(self.games) > MAX_TRACKED_GAMES:
+                self.games.popitem(last=False)
+        else:
+            self.games.move_to_end(game_id)
         return g
+
+    def stats(self, game_id):
+        """Resumen de UNA partida: digitos correctos, X, errores y tiempos."""
+        g = self.games.get(game_id)
+        if g is None:
+            return {'ok': 0, 'x': 0, 'bad': 0, 'times': []}
+        return {'ok': g['ok'], 'x': g['x'], 'bad': g['bad'],
+                'times': list(g['times'])}
 
     # ---------------- utilidades de grilla ----------------
 
@@ -413,7 +433,10 @@ class Brain:
             occ[cell] = L - i + 1          # +1: margen por crecimiento
         Lo = len(opp_order)
         for j, cell in enumerate(opp_order):
-            v = Lo - j
+            # Para PLANIFICAR asumo que su cuerpo avanza y libera casillas, pero
+            # para medir si me encierro eso es peligrosamente optimista: la
+            # huida terminaba pasando "a traves" del rival. Aca no se libera.
+            v = 10 ** 6 if SAFETY_OPP_STATIC else Lo - j   # 10**6 = nunca
             if v > occ.get(cell, 0):
                 occ[cell] = v
         if opp_head is not None:
@@ -589,18 +612,22 @@ class Brain:
         dest = (head[0] + dr, head[1] + dc)
         if dest in digits:
             if dest == tgt_cell:
-                self.eaten_ok += 1
+                g['ok'] += 1
             else:
-                self.eaten_bad += 1
+                g['bad'] += 1
         elif dest in ent['X']:
-            self.eaten_x += 1
+            g['x'] += 1
 
         self.last = {'plans': len(plans), 'best': best, 'dir': direction,
                      'survival': best is None, 'tgt': tgt_cell, 'tval': tgt_val,
                      'seq': seq, 'wrong': wrong, 'head': head,
                      'my_moves': my_moves, 'legal': [n for n, _ in legal],
                      'base': {k: (v['safe'], v['area']) for k, v in base.items()}}
-        self.timings.append(time.perf_counter() - t0)
+        elapsed = time.perf_counter() - t0
+        g['times'].append(elapsed)
+        self.timings.append(elapsed)
+        if len(self.timings) > 2000:        # ventana acotada: otra fuga menos
+            del self.timings[:-2000]
         return direction
 
     # ---------------- piezas de la decision ----------------
@@ -919,29 +946,28 @@ async def play(websocket):
 
             elif event == 'game_over':
                 write_live({**request_data['data'], 'event': 'game_over'})
-                game_id = request_data['data'].get('game_id')
+                d = request_data['data']
+                game_id = d.get('game_id')
+                # Leo las estadisticas ANTES de soltar el estado de la partida.
+                st = BRAIN.stats(game_id)
                 if game_id:
                     log_event(game_id, request_data)
                     write_game_log(game_id)
                     BRAIN.games.pop(game_id, None)
-                d = request_data['data']
-                side = 'A' if d.get('player_1') == d.get('winner') else None
                 print('-' * 62)
                 print('FIN | bot {} | score_1 {} (x{}) | score_2 {} (x{}) | gana {}'
                       .format(BOT_VERSION, d.get('score_1'), d.get('multiplier_1'),
                               d.get('score_2'), d.get('multiplier_2'), d.get('winner')))
                 print('comidos: {} digitos correctos, {} X, {} digitos ERRADOS'
-                      .format(BRAIN.eaten_ok, BRAIN.eaten_x, BRAIN.eaten_bad))
-                if BRAIN.eaten_bad:
+                      .format(st['ok'], st['x'], st['bad']))
+                if st['bad']:
                     print('AVISO: comer un digito equivocado son -500. Si este numero '
                           'no es 0, mandame el log.')
-                if BRAIN.timings:
-                    ts = BRAIN.timings
+                if st['times']:
+                    ts = st['times']
                     print('tiempo por jugada: medio {:.1f} ms | maximo {:.1f} ms'
                           .format(1000 * sum(ts) / len(ts), 1000 * max(ts)))
                 print('-' * 62)
-                BRAIN.timings = []
-                BRAIN.eaten_ok = BRAIN.eaten_x = BRAIN.eaten_bad = 0
 
             elif event == 'error':
                 print('server error: {}'.format(request_data.get('data')))
@@ -977,10 +1003,6 @@ async def start(auth_token):
 
 
 if __name__ == '__main__':   # pragma: no cover
-    if len(sys.argv) >= 2:
-        asyncio.run(start(sys.argv[1]))
-    else:
-        print('please provide your auth_token')
     if len(sys.argv) >= 2:
         asyncio.run(start(sys.argv[1]))
     else:
