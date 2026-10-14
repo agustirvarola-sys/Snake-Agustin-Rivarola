@@ -1,0 +1,38 @@
+name: tests
+
+# Corre en cada push a main y en cada pull request, que es lo que pide la rubrica.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # ademas permite lanzarlo a mano desde la pestaña Actions
+
+jobs:
+  test:
+    name: pytest + cobertura
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Traer el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest coverage
+          # websockets solo hace falta para jugar de verdad; si hay
+          # requirements.txt lo instalamos tambien.
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Correr los tests midiendo cobertura
+        run: coverage run -m pytest -v
+
+      - name: Informe de cobertura y umbral del 90 %
+        # Si la cobertura baja del 90 % este paso falla y con el todo el workflow.
+        run: coverage report -m --fail-under=90
