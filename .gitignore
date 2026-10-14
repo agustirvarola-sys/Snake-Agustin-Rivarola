@@ -5,3 +5,4 @@ htmlcov/
 *.log
 live.tmp
 live.json
+snake_viewer.html

@@ -1,0 +1,21 @@
+# Configuracion de cobertura. La usa tanto `coverage run -m pytest` en local
+# como el workflow de GitHub Actions.
+#
+# Mide SOLO el bot: incluir los tests en la medicion infla el numero sin
+# decir nada util (un archivo de tests siempre se ejecuta entero).
+
+[run]
+# 'include' y no 'source': source espera un modulo o un directorio, con un
+# nombre de archivo no mide nada y el informe sale vacio.
+include = run.py
+branch = True
+
+[report]
+# El umbral tambien esta en el workflow (coverage report --fail-under=90),
+# dejarlo aca hace que correrlo en local se comporte igual que el CI.
+fail_under = 90
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
